@@ -33,6 +33,8 @@
   Each nested query increments this counter by 1."
   0)
 
+(def ^:private source-table-alias "t1")
+
 (defn- driver [] {:pre [(map? *query*)]} (:driver *query*))
 
 ;; register the function "distinct-count" with HoneySQL
@@ -80,6 +82,21 @@
   (formatted [this]
     "Return an appropriate HoneySQL form for an object."))
 
+(defn- resolve-table-alias [{:keys [schema-name table-name special-type field-name] :as field}]
+  (let [source-table (or (get-in *query* [:query :source-table])
+                         (get-in *query* [:query :source-query :source-table]) )]
+    (if (and (= schema-name (:schema source-table))
+             (= table-name (:name source-table)))
+      (-> (assoc field :schema-name nil)
+          (assoc :table-name source-table-alias))
+      (if-let [matching-join-table (->> (get-in *query* [:query :join-tables])
+                                          (filter #(and (= schema-name (:schema %))
+                                                        (= table-name (:table-name %))))
+                                          first)]
+        (-> (assoc field :schema-name nil)
+            (assoc :table-name (:join-alias matching-join-table)))
+        field))))
+
 (extend-protocol IGenericSQLFormattable
   nil                    (formatted [_] nil)
   Number                 (formatted [this] this)
@@ -98,8 +115,10 @@
     (formatted (expression-with-name expression-name)))
 
   Field
-  (formatted [{:keys [schema-name table-name special-type field-name]}]
-    (let [field (keyword (hx/qualify-and-escape-dots schema-name table-name field-name))]
+  (formatted [field-before-aliasing]
+    ;; field-before-aliasing needs to be found in our table aliases
+    (let [{:keys [schema-name table-name special-type field-name] :as alias} (resolve-table-alias field-before-aliasing)
+          field (keyword (hx/qualify-and-escape-dots schema-name table-name field-name))]
       (cond
         (isa? special-type :type/UNIXTimestampSeconds)      (sql/unix-timestamp->timestamp (driver) field :seconds)
         (isa? special-type :type/UNIXTimestampMilliseconds) (sql/unix-timestamp->timestamp (driver) field :milliseconds)
@@ -206,6 +225,63 @@
         form
         (recur form more)))))
 
+(defn- update-select-subclause-aliases
+  "Given a vector of HoneySQL SELECT-SUBCLAUSES and a vector of equal length of NEW-ALIASES,
+   return a new vector with combining the original `SELECT` subclauses with the new aliases.
+
+   Subclauses that are not aliased are not modified; they are given a placeholder of `nil` in the NEW-ALIASES vector.
+
+     (update-select-subclause-aliases [[:user_id \"user_id\"] :venue_id]
+                                      [\"user_id_2\" nil])
+     ;; -> [[:user_id \"user_id_2\"] :venue_id]"
+  [select-subclauses new-aliases]
+  (for [[subclause new-alias] (partition 2 (interleave select-subclauses new-aliases))]
+    (if-not new-alias
+      subclause
+      [(first subclause) new-alias])))
+
+(defn- select-subclauses->aliases
+  "Return a vector of aliases used in HoneySQL SELECT-SUBCLAUSES.
+   (For clauses that aren't aliased, `nil` is returned as a placeholder)."
+  [select-subclauses]
+  (for [subclause select-subclauses]
+    (when (and (vector? subclause)
+               (= 2 (count subclause)))
+      (second subclause))))
+
+(defn- deduplicate-aliases
+  "Given a sequence of aliases, return a sequence where duplicate aliases have been appropriately suffixed.
+
+     (deduplicate-aliases [\"sum\" \"count\" \"sum\" \"avg\" \"sum\" \"min\"])
+     ;; -> [\"sum\" \"count\" \"sum_2\" \"avg\" \"sum_3\" \"min\"]"
+  [aliases]
+  (loop [acc [], alias->use-count {}, [alias & more, :as aliases] aliases]
+    (let [use-count (get alias->use-count alias)]
+      (cond
+        (empty? aliases) acc
+        (not alias)      (recur (conj acc alias) alias->use-count more)
+        (not use-count)  (recur (conj acc alias) (assoc alias->use-count alias 1) more)
+        :else            (let [new-count (inc use-count)
+                               new-alias (str alias "_" new-count)]
+                           (recur (conj acc new-alias) (assoc alias->use-count alias new-count, new-alias 1) more))))))
+
+(defn- deduplicate-select-aliases
+  "Replace duplicate aliases in SELECT-SUBCLAUSES with appropriately suffixed aliases.
+
+   BigQuery doesn't allow duplicate aliases in `SELECT` statements; a statement like `SELECT sum(x) AS sum, sum(y) AS sum` is invalid. (See #4089)
+   To work around this, we'll modify the HoneySQL aliases to make sure the same one isn't used twice by suffixing duplicates appropriately.
+   (We'll generate SQL like `SELECT sum(x) AS sum, sum(y) AS sum_2` instead.)"
+  [select-subclauses]
+  (let [aliases (select-subclauses->aliases select-subclauses)
+        deduped (deduplicate-aliases aliases)]
+    (update-select-subclause-aliases select-subclauses deduped)))
+
+(defn apply-aggregation-deduplicate-select-aliases
+  "An implementation of `apply-aggregation` that just hands off to the normal Generic SQL implementation, but calls `deduplicate-select-aliases` on the results."
+  [driver honeysql-form query]
+  (-> (apply-aggregation driver honeysql-form query)
+      (update :select deduplicate-select-aliases)))
+
 (defn apply-breakout
   "Apply a `breakout` clause to HONEYSQL-FORM. Default implementation of `apply-breakout` for SQL drivers."
   [_ honeysql-form {breakout-fields :breakout, fields-fields :fields :as query}]
@@ -259,8 +335,8 @@
   (loop [honeysql-form honeysql-form, [{:keys [table-name pk-field source-field schema join-alias]} & more] join-tables]
     (let [honeysql-form (h/merge-left-join honeysql-form
                           [(hx/qualify-and-escape-dots schema table-name) (keyword join-alias)]
-                          [:= (hx/qualify-and-escape-dots source-schema source-table-name (:field-name source-field))
-                              (hx/qualify-and-escape-dots join-alias                      (:field-name pk-field))])]
+                          [:= (hx/qualify-and-escape-dots source-table-alias (:field-name source-field))
+                              (hx/qualify-and-escape-dots join-alias         (:field-name pk-field))])]
       (if (seq more)
         (recur honeysql-form more)
         honeysql-form))))
@@ -289,9 +365,26 @@
       (h/limit items)
       (h/offset (* items (dec page)))))
 
+(defn apply-page-using-row-number-for-offset
+  "Apply `page` clause to HONEYSQL-FROM, using row_number() for drivers that do not support offsets"
+  [driver honeysql-form {{:keys [items page]} :page}]
+  (let [offset (* (dec page) items)]
+    (if (zero? offset)
+      ;; if there's no offset we can simply use limit
+      (h/limit honeysql-form items)
+      ;; if we need to do an offset we have to do nesting to generate a row number and where on that
+      (let [over-clause (format "row_number() OVER (%s)"
+                                (first (hsql/format (select-keys honeysql-form [:order-by])
+                                                    :allow-dashed-names? true
+                                                    :quoting (:quote-style driver))))]
+        (-> (apply h/select (map last (:select honeysql-form)))
+            (h/from (h/merge-select honeysql-form [(hsql/raw over-clause) :__rownum__]))
+            (h/where [:> :__rownum__ offset])
+            (h/limit items))))))
+
 (defn- apply-source-table [honeysql-form {{table-name :name, schema :schema} :source-table}]
   {:pre [table-name]}
-  (h/from honeysql-form (hx/qualify-and-escape-dots schema table-name)))
+  (h/from honeysql-form [(hx/qualify-and-escape-dots schema table-name) source-table-alias]))
 
 (declare apply-clauses)
 
@@ -438,7 +531,10 @@
            second)             ; so just return the part of the exception that is relevant
       (.getMessage e)))
 
-(defn- do-with-try-catch {:style/indent 0} [f]
+(defn do-with-try-catch
+  "Tries to run the function `f`, catching and printing exception chains if SQLException is thrown,
+   and rethrowing the exception as an Exception with a nicely formatted error message."
+  {:style/indent 0} [f]
   (try (f)
        (catch SQLException e
          (log/error (jdbc/print-sql-exception-chain e))

@@ -63,7 +63,8 @@
                  [hiccup "1.0.5"]                                     ; HTML templating
                  [honeysql "0.8.2"]                                   ; Transform Clojure data structures to SQL
                  [io.crate/crate-jdbc "2.1.6"]                        ; Crate JDBC driver
-                 [kixi/stats "0.3.10"                                 ; Various statistic measures implemented as transducers
+                 [javax.validation/validation-api "1.1.0.Final"]      ; Fix DRILL-5383
+                 [kixi/stats "0.3.10"                                  ; Various statistic measures implemented as transducers
                   :exclusions [org.clojure/test.check                 ; test.check and AVL trees are used in kixi.stats.random. Remove exlusion if using.
                                org.clojure/data.avl]]
                  [log4j/log4j "1.2.17"                                ; logging framework
@@ -83,10 +84,20 @@
                  [com.clearspring.analytics/stream "2.9.5"            ; Various sketching algorithms
                   :exclusions [org.slf4j/slf4j-api
                                it.unimi.dsi/fastutil]]
+                 [org.apache.drill.exec/drill-jdbc-all "1.10.0"       ; Drill JDBC driver
+                  :exclusions [org.slf4j/log4j-over-slf4j
+                               org.slf4j/jcl-over-slf4j
+                               org.slf4j/slf4j-api
+                               log4j]]
                  [org.clojars.pntblnk/clj-ldap "0.0.12"]              ; LDAP client
                  [org.liquibase/liquibase-core "3.5.3"]               ; migration management (Java lib)
                  [org.postgresql/postgresql "42.1.4.jre7"]            ; Postgres driver
                  [org.slf4j/slf4j-log4j12 "1.7.25"]                   ; abstraction for logging frameworks -- allows end user to plug in desired logging framework at deployment time
+                 [org.spark-project.hive/hive-jdbc "1.2.1.spark2"
+                  :exclusions [org.codehaus.jackson/jackson-xc
+                               org.eclipse.jetty.aggregate/jetty-all
+                               org.mortbay.jetty/jetty]
+                  :classifier "standalone"]
                  [org.tcrawley/dynapath "0.2.5"]                      ; Dynamically add Jars (e.g. Oracle or Vertica) to classpath
                  [org.xerial/sqlite-jdbc "3.16.1"]                    ; SQLite driver
                  [org.yaml/snakeyaml "1.18"]                          ; YAML parser (required by liquibase)
@@ -147,8 +158,14 @@
                               :exclusions [org.clojure/clojure
                                            org.clojure/tools.namespace]]]
                    :env {:mb-run-mode "dev"}
-                   :jvm-opts ["-Dlogfile.path=target/log"]
-                   :aot [metabase.logger]}                            ; Log appender class needs to be compiled for log4j to use it
+                   :jvm-opts ["-Dlogfile.path=target/log"
+                              "-Xms1024m"                             ; give JVM a decent heap size to start with
+                              "-Xmx2048m"]                            ; hard limit of 2GB so we stop hitting the 4GB container limit on CircleCI
+                   ;; Log appender class needs to be compiled for log4j to use it,
+                   ;; classes for fixed Hive driver in must be compiled for tests
+                   :aot [metabase.logger
+                         metabase.driver.FixedHiveConnection
+                         metabase.driver.FixedHiveDriver]}
              :ci {:jvm-opts ["-Xmx3g"]}
              :reflection-warnings {:global-vars {*warn-on-reflection* true}} ; run `lein check-reflection-warnings` to check for reflection warnings
              :expectations {:injections [(require 'metabase.test-setup)]
